@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#7ec8f0">
+<meta name="color-scheme" content="dark">
+<title>Додо-ран — мини-игра</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;overflow:hidden;background:#0b1520;
+    font:16px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+  canvas{display:block;width:100%;height:100%;touch-action:none}
+  .overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:14px;padding:24px;text-align:center;background:rgba(10,26,18,.78);backdrop-filter:blur(5px);z-index:5}
+  .overlay.hidden{display:none}
+  .title{font-size:30px;font-weight:800;margin:0;color:#fff;text-shadow:0 3px 16px rgba(0,0,0,.45)}
+  .sub{color:#cfe3d2;font-size:15px;max-width:340px;margin:0}
+  .btn{appearance:none;border:0;border-radius:16px;padding:14px 28px;font:inherit;font-weight:800;font-size:17px;
+    color:#16320f;background:linear-gradient(135deg,#f2d13c,#8fd14f);cursor:pointer;
+    box-shadow:0 10px 26px rgba(143,209,79,.3);transition:transform .12s ease}
+  .btn:active{transform:scale(.97)}
+  .result{font-size:17px;color:#fff}
+  .result b{font-size:30px;display:block}
+  .best{color:#cfe3d2;font-size:14px}
+  .hintline{color:#a9c6ae;font-size:13px;max-width:320px}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div class="overlay" id="overlay">
+  <h1 class="title">Додо-ран</h1>
+  <p class="sub">Додо бежит по острову. Тапай по кустам и мосхопсам — собирай еду.<br>Тапай по рапторам, чтобы накормить их и прогнать.</p>
+  <button class="btn" id="startBtn">Играть</button>
+  <p class="hintline">Шкала «Здоровье» слева, время — справа. Сунь еду раптору, пока он не добежал.</p>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const startBtn = document.getElementById('startBtn');
+
+  const BEST_KEY = 'dodo-ark-best-v1';
+
+  let W = 0, H = 0, dpr = 1, S = 1;
+  let groundY = 0, fieldTop = 0;
+  let running = false, lastTime = 0;
+  let st = null;
+
+  // ---------- геометрия ----------
+  function resize(){
+    dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    S = Math.max(.8, Math.min(1.4, Math.min(W, H) / 430));
+    fieldTop = Math.round(H * (W > H ? .30 : .28));
+    groundY = Math.round(H * (W > H ? .72 : .66));
+  }
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', () => setTimeout(resize, 120));
+
+  // ---------- состояние ----------
+  function newState(){
+    const dodoX = Math.max(56, W * .17);
+    return {
+      t: 0,
+      dist: 0,
+      score: 0,
+      bonus: 0,
+      hp: 100,
+      berry: 0,
+      meat: 0,
+      tool: 'hand',            // 'hand' | 'axe'
+      dodoX,
+      shake: 0,
+      decor: [],
+      bushes: [],
+      moss: [],
+      rapt: [],
+      bits: [],
+      pops: [],
+      ripples: [],
+      timers: { decor: 0, bush: .8, moss: 2.2, rapt: 4.0 },
+      level: 1
+    };
+  }
+
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+  function pop(text, x, y, color){ st.pops.push({ text, x, y, life: 1, color: color || '#fff' }); }
+  function burst(x, y, color, n){
+    for (let i = 0; i < (n || 8); i++){
+      st.bits.push({ x, y, vx: rnd(-130, 130), vy: rnd(-260, -60), life: rnd(.35, .85), color, r: rnd(2, 4) });
+    }
+  }
+  function ripple(x, y){ st.ripples.push({ x, y, life: .45 }); }
+
+  // ---------- спавн ----------
+  function spawnDecor(){
+    const kind = Math.random();
+    const type = kind < .55 ? 'stump' : (kind < .8 ? 'grass' : 'palm');
+    st.decor.push({ type, x: W + 80 * S, y: groundY + rnd(-24, 8) * S, s: rnd(.85, 1.15) });
+  }
+  function spawnBush(){
+    st.bushes.push({ x: W + 60 * S, hits: 2, dead: 0, shake: 0, s: rnd(.9, 1.1) });
+  }
+  function spawnMoss(){
+    st.moss.push({ x: W + 60 * S, hits: st.tool === 'axe' ? 2 : 3, dead: 0, t: Math.random() * 6, s: rnd(.9, 1.1) });
+  }
+  function spawnRaptor(){
+    const v = clamp(46 + st.t * 3.6, 46, 135);
+    st.rapt.push({ x: W + 70 * S, v: rnd(v * .85, v * 1.1), fed: 0, hit: 0, step: Math.random() * 9, s: rnd(.92, 1.08) });
+  }
+
+  // ---------- обновление ----------
+  function update(dt){
+    st.t += dt;
+    const walk = (58 + Math.min(st.t * 2.2, 64)) * S;
+    st.dist += walk * dt;
+    st.score = Math.floor(st.dist / (12 * S)) + st.bonus;
+    if (st.shake > 0) st.shake = Math.max(0, st.shake - dt * 3.4);
+
+    st.timers.decor -= dt;
+    if (st.timers.decor <= 0){ spawnDecor(); st.timers.decor = rnd(.45, 1.1); }
+
+    st.timers.bush -= dt;
+    if (st.timers.bush <= 0 && st.bushes.filter(b => !b.dead).length < 3){
+      spawnBush();
+      st.timers.bush = rnd(1.9, 3.4);
+    }
+    st.timers.moss -= dt;
+    if (st.timers.moss <= 0 && st.moss.filter(m => !m.dead).length < 2){
+      spawnMoss();
+      st.timers.moss = rnd(2.8, 4.8);
+    }
+    st.timers.rapt -= dt;
+    if (st.timers.rapt <= 0){
+      spawnRaptor();
+      const base = clamp(6.4 - st.t * .07, 2.3, 6.4);
+      st.timers.rapt = rnd(base * .75, base * 1.35);
+      st.level = 1 + Math.floor(st.t / 25);
+    }
+
+    for (const d of st.decor) d.x -= walk * dt;
+    st.decor = st.decor.filter(d => d.x > -140 * S);
+
+    for (const b of st.bushes){
+      b.x -= walk * dt;
+      if (b.shake > 0) b.shake = Math.max(0, b.shake - dt * 4);
+      if (b.dead > 0) b.dead += dt;
+    }
+    st.bushes = st.bushes.filter(b => b.x > -120 * S && b.dead < .9);
+
+    for (const m of st.moss){
+      m.t += dt;
+      m.x -= walk * .32 * dt;
+      if (m.dead > 0) m.dead += dt;
+    }
+    st.moss = st.moss.filter(m => m.x > -120 * S && m.dead < .9);
+
+    for (const r of st.rapt){
+      r.step += dt * 10;
+      if (r.fed > 0){
+        r.fed += dt;
+        r.x += 190 * S * dt;
+      } else {
+        r.x -= r.v * dt;
+        if (r.x < st.dodoX + 46 * S){
+          damage(14);
+          r.hit = 1;
+          r.x = -999;
+        }
+      }
+    }
+    st.rapt = st.rapt.filter(r => r.x > -160 * S && r.fed < 1.8);
+
+    for (const p of st.pops){ p.life -= dt * 1.35; p.y -= 36 * dt; }
+    st.pops = st.pops.filter(p => p.life > 0);
+
+    for (const b of st.bits){
+      b.life -= dt;
+      b.vy += 620 * dt;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+    }
+    st.bits = st.bits.filter(b => b.life > 0);
+
+    for (const r of st.ripples) r.life -= dt;
+    st.ripples = st.ripples.filter(r => r.life > 0);
+
+    if (st.hp <= 0) gameOver();
+  }
+
+  function damage(amount){
+    st.hp = Math.max(0, st.hp - amount);
+    st.shake = 1;
+    burst(st.dodoX + 10 * S, groundY - 40 * S, '#e2554e', 10);
+    pop('-' + amount, st.dodoX, groundY - 100 * S, '#e2554e');
+    if (navigator.vibrate) navigator.vibrate(45);
+  }
+
+  // ---------- ввод ----------
+  function tapAt(x, y){
+    ripple(x, y);
+
+    // панель предметов
+    const slots = slotRects();
+    for (let i = 0; i < slots.length; i++){
+      const r = slots[i];
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h){
+        if (i === 0) st.tool = 'hand';
+        if (i === 1) st.tool = 'axe';
+        return;
+      }
+    }
+    if (!running) return;
+
+    // рапторы
+    let target = null, bestD = 1e9;
+    for (const r of st.rapt){
+      if (r.fed > 0) continue;
+      const dx = x - r.x, dy = y - (groundY - 44 * S * r.s);
+      const d = Math.hypot(dx * .8, dy);
+      if (d < 78 * S && d < bestD){ target = r; bestD = d; }
+    }
+    if (target){
+      if (st.meat > 0 || st.berry > 0){
+        if (st.meat > 0) st.meat -= 1; else st.berry -= 1;
+        target.fed = .001;
+        st.bonus += 12;
+        pop('+12 накормлен', target.x, groundY - 120 * S, '#ffe066');
+        burst(target.x, groundY - 50 * S, '#ff8fb1', 7);
+      } else {
+        pop('нет еды!', target.x, groundY - 120 * S, '#ff6b6b');
+      }
+      return;
+    }
+
+    // мосхопсы
+    for (const m of st.moss){
+      if (m.dead > 0) continue;
+      const dx = x - m.x, dy = y - (groundY - 34 * S * m.s);
+      if (Math.hypot(dx * .8, dy) < 66 * S){
+        m.hits -= 1;
+        m.shake = .6;
+        burst(m.x, groundY - 30 * S, '#9a8478', 5);
+        if (m.hits <= 0){
+          m.dead = .001;
+          st.meat += 2;
+          st.bonus += 5;
+          pop('+2 мясо', m.x, groundY - 96 * S, '#ffd27f');
+        }
+        return;
+      }
+    }
+
+    // кусты
+    for (const b of st.bushes){
+      if (b.dead > 0) continue;
+      const dx = x - b.x, dy = y - (groundY - 40 * S);
+      if (Math.abs(dx) < 52 * S && dy > -70 * S && dy < 60 * S){
+        b.hits -= 1;
+        b.shake = 1;
+        burst(b.x, groundY - 34 * S, '#b06bb5', 5);
+        if (b.hits <= 0){
+          b.dead = .001;
+          st.berry += 2;
+          st.bonus += 4;
+          pop('+2 ягоды', b.x, groundY - 96 * S, '#e0a6ff');
+        }
+        return;
+      }
+    }
+  }
+
+  // ---------- рисование ----------
+  function draw(){
+    const sx = st.shake ? (Math.random() - .5) * 12 * st.shake : 0;
+    const sy = st.shake ? (Math.random() - .5) * 12 * st.shake : 0;
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    drawSky();
+    drawField();
+    drawDecor();
+    drawBushes();
+    drawMoss();
+    drawRaptors();
+    drawDodo();
+    drawBits();
+    drawRipples();
+    drawPops();
+
+    ctx.restore();
+
+    drawHud();
+    drawToolbar();
+    drawLoading();
+  }
+
+  function drawSky(){
+    const sky = ctx.createLinearGradient(0, 0, 0, fieldTop);
+    sky.addColorStop(0, '#4fb4e8');
+    sky.addColorStop(1, '#a9e2f7');
+    ctx.fillStyle = sky;
+    ctx.fillRect(-20, -20, W + 40, fieldTop + 40);
+
+    // облака
+    const off = (st.dist * .12) % (W * .8);
+    ctx.fillStyle = 'rgba(255,255,255,.92)';
+    for (let i = -1; i < 4; i++){
+      const cx = i * W * .8 - off + 40;
+      const cy = fieldTop * .32 + (i % 2) * 22;
+      cloud(cx, cy, 34 * S);
+      cloud(cx + 150 * S, cy + 30 * S, 24 * S);
+    }
+
+    // дальние холмы
+    const hoff = (st.dist * .18) % (W * .9);
+    ctx.fillStyle = '#8fd45a';
+    for (let i = -1; i < 4; i++){
+      const cx = i * W * .9 - hoff;
+      ctx.beginPath();
+      ctx.moveTo(cx - W * .5, fieldTop + 6);
+      ctx.quadraticCurveTo(cx, fieldTop - H * .05, cx + W * .5, fieldTop + 6);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  function cloud(x, y, r){
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.arc(x + r * .9, y + r * .18, r * .78, 0, Math.PI * 2);
+    ctx.arc(x - r * .85, y + r * .22, r * .68, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawField(){
+    const g = ctx.createLinearGradient(0, fieldTop, 0, H);
+    g.addColorStop(0, '#7fce4a');
+    g.addColorStop(.55, '#69bd3c');
+    g.addColorStop(1, '#4f9c2e');
+    ctx.fillStyle = g;
+    ctx.fillRect(-20, fieldTop, W + 40, H - fieldTop + 20);
+
+    // тёмная линия горизонта
+    ctx.fillStyle = 'rgba(255,255,255,.18)';
+    ctx.fillRect(-20, fieldTop, W + 40, 3);
+
+    // трава
+    ctx.strokeStyle = 'rgba(38,104,30,.45)';
+    ctx.lineWidth = 2;
+    const step = 34 * S;
+    const off = st.dist % step;
+    for (let x = -off; x < W + step; x += step){
+      const h = (7 + ((Math.floor(x / step) * 37) % 8)) * S;
+      ctx.beginPath();
+      ctx.moveTo(x, groundY + 16 * S);
+      ctx.quadraticCurveTo(x + 4 * S, groundY + 16 * S - h, x + 9 * S, groundY + 14 * S - h * .6);
+      ctx.stroke();
+    }
+
+    // кусты переднего плана
+    ctx.fillStyle = '#3f8a25';
+    const bstep = 66 * S;
+    const boff = (st.dist * 1.15) % bstep;
+    for (let x = -boff; x < W + bstep * 2; x += bstep){
+      ctx.beginPath();
+      ctx.ellipse(x, groundY + 44 * S, 30 * S, 20 * S, 0, Math.PI, 0);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(x + bstep * .5, groundY + 62 * S, 34 * S, 17 * S, 0, Math.PI, 0);
+      ctx.fill();
+    }
+  }
+
+  function drawDecor(){
+    for (const d of st.decor){
+      ctx.save();
+      ctx.translate(d.x, d.y);
+      ctx.scale(d.s * S, d.s * S);
+      ctx.fillStyle = 'rgba(0,0,0,.14)';
+      ctx.beginPath(); ctx.ellipse(0, 2, 24, 6, 0, 0, Math.PI * 2); ctx.fill();
+
+      if (d.type === 'stump'){
+        ctx.fillStyle = '#8a5a2b';
+        ctx.beginPath();
+        ctx.moveTo(-14, 0); ctx.lineTo(-10, -22); ctx.lineTo(10, -22); ctx.lineTo(14, 0);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#b9834a';
+        ctx.beginPath(); ctx.ellipse(0, -22, 11, 4.6, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = 'rgba(110,70,30,.55)'; ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.ellipse(0, -22, 6, 2.6, 0, 0, Math.PI * 2); ctx.stroke();
+      } else if (d.type === 'palm'){
+        ctx.fillStyle = '#8a5a2b';
+        ctx.beginPath();
+        ctx.moveTo(-5, 0); ctx.quadraticCurveTo(-2, -40, 4, -78);
+        ctx.lineTo(11, -76); ctx.quadraticCurveTo(6, -38, 6, 0);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#3f9c3f';
+        for (let i = 0; i < 6; i++){
+          ctx.save();
+          ctx.translate(8, -78);
+          ctx.rotate(-Math.PI * .9 + i * Math.PI * .3);
+          ctx.beginPath();
+          ctx.ellipse(20, 0, 22, 7, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+        ctx.fillStyle = '#2f7a2f';
+        ctx.beginPath(); ctx.arc(8, -78, 5, 0, Math.PI * 2); ctx.fill();
+      } else {
+        ctx.strokeStyle = '#3f8f2a'; ctx.lineWidth = 2.4;
+        for (let i = -1; i <= 1; i++){
+          ctx.beginPath();
+          ctx.moveTo(i * 5, 0);
+          ctx.quadraticCurveTo(i * 10, -12, i * 14, -18);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawBushes(){
+    for (const b of st.bushes){
+      const shake = Math.sin(b.shake * 20) * b.shake * 4;
+      ctx.save();
+      ctx.translate(b.x + shake, groundY);
+      ctx.scale(b.s * S, b.s * S);
+      if (b.dead > 0) ctx.globalAlpha = Math.max(0, 1 - b.dead / .9);
+
+      ctx.fillStyle = 'rgba(0,0,0,.16)';
+      ctx.beginPath(); ctx.ellipse(0, 1, 26, 7, 0, 0, Math.PI * 2); ctx.fill();
+
+      // куст-конус
+      ctx.fillStyle = '#8a5a2b';
+      ctx.beginPath();
+      ctx.moveTo(-20, 0);
+      ctx.lineTo(-6, -40); ctx.lineTo(6, -40); ctx.lineTo(20, 0);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#a06a33';
+      ctx.beginPath();
+      ctx.moveTo(-20, 0); ctx.lineTo(-6, -40); ctx.lineTo(0, -40); ctx.lineTo(-10, 0);
+      ctx.closePath(); ctx.fill();
+
+      // ягоды
+      ctx.fillStyle = '#7b3f8a';
+      ctx.beginPath(); ctx.arc(-6, -6, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(2, -3, 3.4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#9d54ad';
+      ctx.beginPath(); ctx.arc(-1, -10, 3.2, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawMoss(){
+    for (const m of st.moss){
+      ctx.save();
+      ctx.translate(m.x, groundY);
+      ctx.scale(m.s * S, m.s * S);
+      if (m.dead > 0){
+        ctx.globalAlpha = Math.max(0, 1 - m.dead / .9);
+        ctx.rotate(-m.dead * 1.6);
+      }
+      const step = Math.sin(m.t * 4) * 2;
+
+      ctx.fillStyle = 'rgba(0,0,0,.16)';
+      ctx.beginPath(); ctx.ellipse(0, 1, 36, 8, 0, 0, Math.PI * 2); ctx.fill();
+
+      // ноги
+      ctx.strokeStyle = '#6f5d4c'; ctx.lineWidth = 8; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-16, -16); ctx.lineTo(-18, 0 + step); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(14, -16); ctx.lineTo(16, 0 - step); ctx.stroke();
+
+      // тело
+      ctx.fillStyle = '#8a7b6d';
+      ctx.beginPath(); ctx.ellipse(0, -30, 34, 22, 0, 0, Math.PI * 2); ctx.fill();
+      // горб
+      ctx.fillStyle = '#9c8d7e';
+      ctx.beginPath(); ctx.ellipse(-4, -40, 24, 12, 0, 0, Math.PI * 2); ctx.fill();
+      // голова
+      ctx.fillStyle = '#7d6f62';
+      ctx.beginPath(); ctx.ellipse(32, -36, 17, 14, 0, 0, Math.PI * 2); ctx.fill();
+      // морда
+      ctx.fillStyle = '#6d6053';
+      ctx.beginPath(); ctx.ellipse(44, -30, 9, 7, 0, 0, Math.PI * 2); ctx.fill();
+      // глаз
+      ctx.fillStyle = '#1a1a1a';
+      ctx.beginPath(); ctx.arc(36, -40, 2.4, 0, Math.PI * 2); ctx.fill();
+      // ухо
+      ctx.fillStyle = '#6a5d51';
+      ctx.beginPath(); ctx.ellipse(22, -46, 5, 7, -.4, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawRaptors(){
+    for (const r of st.rapt){
+      ctx.save();
+      ctx.translate(r.x, groundY);
+      ctx.scale(r.s * S, r.s * S);
+      const dir = r.fed > 0 ? 1 : -1;
+      ctx.scale(dir, 1);
+      if (r.fed > 0) ctx.globalAlpha = Math.max(0, 1 - r.fed / 1.8);
+
+      ctx.fillStyle = 'rgba(0,0,0,.18)';
+      ctx.beginPath(); ctx.ellipse(0, 1, 30, 8, 0, 0, Math.PI * 2); ctx.fill();
+
+      const step = Math.sin(r.step) * 6;
+
+      // хвост
+      ctx.fillStyle = '#a8552a';
+      ctx.beginPath();
+      ctx.moveTo(-16, -36);
+      ctx.quadraticCurveTo(-54, -44 + step * .3, -62, -20 + step * .4);
+      ctx.quadraticCurveTo(-44, -26, -14, -22);
+      ctx.closePath(); ctx.fill();
+
+      // ноги
+      ctx.strokeStyle = '#a8552a'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-4, -20); ctx.lineTo(-12 + step, 0); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(12, -20); ctx.lineTo(16 - step, 0); ctx.stroke();
+      // когти
+      ctx.strokeStyle = '#3a2a1c'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(-12 + step, 0); ctx.lineTo(-18 + step, 2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(16 - step, 0); ctx.lineTo(22 - step, 2); ctx.stroke();
+
+      // тело
+      ctx.fillStyle = '#b5642f';
+      ctx.beginPath(); ctx.ellipse(0, -32, 28, 16, -.12, 0, Math.PI * 2); ctx.fill();
+      // живот
+      ctx.fillStyle = '#8f9b52';
+      ctx.beginPath(); ctx.ellipse(2, -26, 20, 9, -.1, 0, Math.PI * 2); ctx.fill();
+      // шея
+      ctx.fillStyle = '#b5642f';
+      ctx.beginPath(); ctx.ellipse(20, -44, 14, 9, .5, 0, Math.PI * 2); ctx.fill();
+      // голова
+      ctx.beginPath(); ctx.ellipse(32, -50, 15, 9, .12, 0, Math.PI * 2); ctx.fill();
+      // гребень
+      ctx.fillStyle = '#d94a3a';
+      ctx.beginPath();
+      ctx.moveTo(26, -57); ctx.lineTo(30, -68); ctx.lineTo(34, -56);
+      ctx.lineTo(38, -66); ctx.lineTo(41, -54);
+      ctx.closePath(); ctx.fill();
+      // пасть
+      ctx.fillStyle = '#5a2f1c';
+      ctx.beginPath(); ctx.moveTo(42, -50); ctx.lineTo(52, -47); ctx.lineTo(42, -45); ctx.closePath(); ctx.fill();
+      // глаз
+      ctx.fillStyle = '#f7d34a';
+      ctx.beginPath(); ctx.arc(36, -53, 2.8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#151515';
+      ctx.beginPath(); ctx.arc(36.6, -53, 1.3, 0, Math.PI * 2); ctx.fill();
+
+      if (r.fed > 0 && r.fed < .8){
+        ctx.fillStyle = '#ff8fb1';
+        ctx.font = 'bold 22px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('♥', 6, -76);
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawDodo(){
+    const bob = Math.sin(st.t * 8) * 2 * S;
+    const x = st.dodoX, y = groundY;
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(S, S);
+
+    ctx.fillStyle = 'rgba(0,0,0,.2)';
+    ctx.beginPath(); ctx.ellipse(0, 1, 26, 7, 0, 0, Math.PI * 2); ctx.fill();
+
+    // лапы
+    const stp = Math.sin(st.t * 9) * 4;
+    ctx.strokeStyle = '#d98f3a'; ctx.lineWidth = 4.5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(-6, -20); ctx.lineTo(-8 + stp, 0); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(8, -20); ctx.lineTo(10 - stp, 0); ctx.stroke();
+
+    // тело
+    ctx.fillStyle = '#9aa7b0';
+    ctx.beginPath(); ctx.ellipse(0, -38 + bob * .2, 26, 23, 0, 0, Math.PI * 2); ctx.fill();
+    // крыло
+    ctx.fillStyle = '#7f8c96';
+    ctx.beginPath(); ctx.ellipse(-6, -34, 15, 11, .25, 0, Math.PI * 2); ctx.fill();
+    // хвост
+    ctx.fillStyle = '#8d99a3';
+    ctx.beginPath();
+    ctx.moveTo(-20, -48); ctx.lineTo(-38, -56); ctx.lineTo(-30, -38);
+    ctx.closePath(); ctx.fill();
+    // шея и голова
+    ctx.fillStyle = '#3f6a9e';
+    ctx.beginPath(); ctx.ellipse(14, -62 + bob * .4, 12, 15, -.25, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(18, -72 + bob * .4, 11, 10, 0, 0, Math.PI * 2); ctx.fill();
+    // клюв
+    ctx.fillStyle = '#e59a3c';
+    ctx.beginPath();
+    ctx.moveTo(25, -76 + bob * .4);
+    ctx.quadraticCurveTo(46, -72 + bob * .4, 38, -63 + bob * .4);
+    ctx.quadraticCurveTo(30, -64 + bob * .4, 25, -68 + bob * .4);
+    ctx.closePath(); ctx.fill();
+    // глаз
+    ctx.fillStyle = '#111';
+    ctx.beginPath(); ctx.arc(22, -76 + bob * .4, 2.6, 0, Math.PI * 2); ctx.fill();
+    // хохолок
+    ctx.strokeStyle = '#2f5482'; ctx.lineWidth = 3.5;
+    ctx.beginPath();
+    ctx.moveTo(14, -81 + bob * .4);
+    ctx.quadraticCurveTo(10, -90 + bob * .4, 16, -93 + bob * .4);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  function drawBits(){
+    for (const b of st.bits){
+      ctx.globalAlpha = clamp(b.life * 1.6, 0, 1);
+      ctx.fillStyle = b.color;
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r || 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawRipples(){
+    for (const r of st.ripples){
+      ctx.globalAlpha = clamp(r.life * 2, 0, .8);
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, (1 - r.life) * 40 + 6, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPops(){
+    ctx.textAlign = 'center';
+    ctx.font = '800 ' + Math.round(17 * S) + 'px -apple-system,Segoe UI,Roboto,Arial,sans-serif';
+    for (const p of st.pops){
+      ctx.globalAlpha = clamp(p.life, 0, 1);
+      ctx.fillStyle = 'rgba(0,0,0,.35)';
+      ctx.fillText(p.text, p.x + 1, p.y + 1);
+      ctx.fillStyle = p.color;
+      ctx.fillText(p.text, p.x, p.y);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- HUD ----------
+  function roundRect(x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawHud(){
+    const pad = 12 * S;
+    const top = Math.max(10, (H - W > 0 ? 10 : 8));
+
+    ctx.font = '800 ' + Math.round(16 * S) + 'px -apple-system,Segoe UI,Roboto,Arial,sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#14351a';
+    ctx.fillText('Здоровье', pad + 1, top + 13 * S + 1);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Здоровье', pad, top + 13 * S);
+
+    const labelW = ctx.measureText('Здоровье').width;
+    const barX = pad + labelW + 10 * S;
+    const barW = Math.min(W * .52, W - barX - 78 * S);
+    const barH = 16 * S;
+    const barY = top + 5 * S;
+
+    ctx.fillStyle = 'rgba(0,0,0,.3)';
+    roundRect(barX, barY, barW, barH, 4 * S); ctx.fill();
+
+    const ratio = st.hp / 100;
+    if (ratio > 0){
+      const g = ctx.createLinearGradient(barX, 0, barX + barW, 0);
+      g.addColorStop(0, '#7ef05a');
+      g.addColorStop(1, '#39c22b');
+      ctx.fillStyle = g;
+      roundRect(barX + 2, barY + 2, Math.max(0, (barW - 4) * ratio), barH - 4, 3 * S);
+      ctx.fill();
+    }
+    // насечки
+    ctx.strokeStyle = 'rgba(0,0,0,.22)';
+    ctx.lineWidth = 1.5;
+    for (let i = 1; i < 10; i++){
+      const x = barX + barW * i / 10;
+      ctx.beginPath(); ctx.moveTo(x, barY + 2); ctx.lineTo(x, barY + barH - 2); ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(255,255,255,.55)';
+    ctx.lineWidth = 2;
+    roundRect(barX, barY, barW, barH, 4 * S); ctx.stroke();
+
+    // таймер
+    const mm = Math.floor(st.t / 60);
+    const ss = Math.floor(st.t % 60);
+    const label = mm + ':' + (ss < 10 ? '0' : '') + ss;
+    ctx.textAlign = 'right';
+    ctx.font = '800 ' + Math.round(17 * S) + 'px -apple-system,Segoe UI,Roboto,Arial,sans-serif';
+    ctx.fillStyle = 'rgba(0,0,0,.35)';
+    ctx.fillText(label, W - pad + 1, top + 13 * S + 1);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, W - pad, top + 13 * S);
+
+    // счёт под таймером
+    ctx.font = '700 ' + Math.round(13 * S) + 'px -apple-system,Segoe UI,Roboto,Arial,sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    ctx.fillText(String(st.score), W - pad, top + 32 * S);
+  }
+
+  function slotRects(){
+    const size = Math.round(52 * S);
+    const gap = Math.round(8 * S);
+    const x0 = Math.round(12 * S);
+    const y0 = Math.round(groundY + (H - groundY) * .28 - size * .1);
+    return [0, 1, 2, 3].map(i => ({ x: x0 + i * (size + gap), y: y0, w: size, h: size }));
+  }
+
+  function drawToolbar(){
+    const slots = slotRects();
+    const labels = ['рука', 'топор', 'ягоды', 'мясо'];
+
+    for (let i = 0; i < slots.length; i++){
+      const r = slots[i];
+      ctx.fillStyle = 'rgba(20,32,18,.55)';
+      roundRect(r.x, r.y, r.w, r.h, 10 * S); ctx.fill();
+      const active = (i === 0 && st.tool === 'hand') || (i === 1 && st.tool === 'axe');
+      ctx.strokeStyle = active ? '#f2d13c' : 'rgba(255,255,255,.35)';
+      ctx.lineWidth = active ? 3 : 2;
+      roundRect(r.x, r.y, r.w, r.h, 10 * S); ctx.stroke();
+
+      const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+      ctx.save();
+      ctx.translate(cx, cy);
+      const u = r.w / 52;
+
+      if (i === 0){
+        // рука
+        ctx.fillStyle = '#e8b98f';
+        roundRect(-9 * u, -6 * u, 20 * u, 15 * u, 5 * u); ctx.fill();
+        ctx.fillStyle = '#f0c9a4';
+        for (let f = 0; f < 3; f++){
+          roundRect((-8 + f * 7) * u, -12 * u, 5 * u, 10 * u, 2.5 * u); ctx.fill();
+        }
+        ctx.beginPath();
+        ctx.ellipse(13 * u, 1 * u, 5 * u, 4 * u, .4, 0, Math.PI * 2); ctx.fill();
+      } else if (i === 1){
+        // топор
+        ctx.strokeStyle = '#c9a26b'; ctx.lineWidth = 4 * u; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(-8 * u, 14 * u); ctx.lineTo(6 * u, -10 * u); ctx.stroke();
+        ctx.fillStyle = '#b9c3cc';
+        ctx.beginPath();
+        ctx.moveTo(2 * u, -14 * u);
+        ctx.lineTo(16 * u, -10 * u);
+        ctx.lineTo(12 * u, 2 * u);
+        ctx.lineTo(0, -4 * u);
+        ctx.closePath(); ctx.fill();
+      } else if (i === 2){
+        ctx.fillStyle = '#7b3f8a';
+        ctx.beginPath(); ctx.arc(-6 * u, 2 * u, 7 * u, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(6 * u, -4 * u, 6 * u, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(4 * u, 7 * u, 5.5 * u, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,.35)';
+        ctx.beginPath(); ctx.arc(-8 * u, -1 * u, 2 * u, 0, Math.PI * 2); ctx.fill();
+      } else {
+        // мясо
+        ctx.strokeStyle = '#efe6d6'; ctx.lineWidth = 4 * u; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(-10 * u, 10 * u); ctx.lineTo(2 * u, -2 * u); ctx.stroke();
+        ctx.fillStyle = '#d9584f';
+        ctx.beginPath();
+        ctx.ellipse(9 * u, -9 * u, 10 * u, 7 * u, -.7, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#f0a3a0';
+        ctx.beginPath();
+        ctx.ellipse(11 * u, -11 * u, 4 * u, 3 * u, -.7, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
+
+      // счётчики
+      if (i >= 2){
+        const n = i === 2 ? st.berry : st.meat;
+        const bx = r.x + r.w - 6 * S, by = r.y + r.h - 6 * S;
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'alphabetic';
+        ctx.font = '800 ' + Math.round(14 * S) + 'px -apple-system,Segoe UI,Roboto,Arial,sans-serif';
+        ctx.fillStyle = 'rgba(0,0,0,.55)';
+        ctx.beginPath();
+        roundRect(bx - 30 * S, by - 17 * S, 30 * S, 19 * S, 9 * S); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText('×' + n, bx - 3 * S, by - 2 * S);
+      }
+    }
+
+    // подсказка по инструменту
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = '700 ' + Math.round(12 * S) + 'px -apple-system,Segoe UI,Roboto,Arial,sans-serif';
+    ctx.fillStyle = 'rgba(10,30,12,.55)';
+    ctx.fillText('тап — удар/сбор · рука или топор', slots[0].x, slots[0].y - 8 * S);
+  }
+
+  function drawLoading(){
+    const barH = Math.round(26 * S);
+    const y = H - barH - Math.max(6, (H * .0));
+    ctx.fillStyle = 'rgba(8,18,10,.72)';
+    ctx.fillRect(0, y, W, barH + 40);
+
+    const prog = (st.t % 240) / 240;
+    const files = Math.min(34, 1 + Math.floor(prog * 34));
+    const mb = (prog * 8.522).toFixed(1);
+
+    ctx.font = '700 ' + Math.round(12 * S) + 'px -apple-system,Segoe UI,Roboto,Arial,sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#eaf4ee';
+    ctx.fillText('Загрузка файла ' + files + ' из 34… (' + mb + ' / 8,522 МБ)', 12 * S, y + 10 * S, W * .62);
+
+    const pw = W - 24 * S;
+    ctx.fillStyle = 'rgba(255,255,255,.22)';
+    roundRect(12 * S, y + 20 * S, pw, 5 * S, 3 * S); ctx.fill();
+    ctx.fillStyle = '#8fd14f';
+    roundRect(12 * S, y + 20 * S, Math.max(3, pw * prog), 5 * S, 3 * S); ctx.fill();
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(220,235,225,.6)';
+    ctx.fillText('Downloading additional files…', W - 12 * S, y + 10 * S, W * .34);
+  }
+
+  // ---------- жизненный цикл ----------
+  function startGame(){
+    st = newState();
+    running = true;
+    lastTime = 0;
+    overlay.classList.add('hidden');
+  }
+
+  function gameOver(){
+    running = false;
+    let best = 0;
+    try { best = Number(localStorage.getItem(BEST_KEY) || 0) || 0; } catch (e) {}
+    if (st.score > best){
+      best = st.score;
+      try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) {}
+    }
+    overlay.innerHTML =
+      '<h1 class="title">Додо устал</h1>' +
+      '<div class="result"><b>' + st.score + '</b>очков</div>' +
+      '<div class="best">рекорд: ' + best + '</div>' +
+      '<button class="btn" id="retryBtn">Ещё раз</button>';
+    overlay.classList.remove('hidden');
+    document.getElementById('retryBtn').addEventListener('click', startGame);
+  }
+
+  function loop(now){
+    if (!lastTime) lastTime = now;
+    let dt = (now - lastTime) / 1000;
+    lastTime = now;
+    dt = Math.min(dt, .05);
+
+    if (running && st){
+      update(dt);
+      if (running) draw();
+    } else if (st){
+      draw();
+    }
+    requestAnimationFrame(loop);
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    tapAt(e.clientX, e.clientY);
+  }, { passive: false });
+
+  document.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('gesturestart', e => e.preventDefault());
+  document.addEventListener('visibilitychange', () => { lastTime = 0; });
+
+  startBtn.addEventListener('click', startGame);
+
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
